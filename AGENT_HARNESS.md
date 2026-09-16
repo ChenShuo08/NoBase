@@ -1,34 +1,37 @@
 # NoBase Agent Harness
 
-> This directory documents the agent harness that powers NoBase's AI backend assistant.  
-> It is intentionally kept minimal in this public repository so the architecture and integration surface can be reviewed without exposing internal platform services.
+> Public-facing architecture note for the agent harness that powers NoBase's AI assistant experience.
+> This repository shares the design, protocol, and integration contract without exposing internal platform source.
 
 ## Overview
 
-The agent harness is responsible for turning a chat message into an auditable execution plan, invoking built-in tools or external MCP tools, streaming partial results back to the UI, and enforcing confirmation gates for risky operations.
+The agent harness turns a chat message into an auditable execution flow. It can invoke built-in tools or MCP tools, stream partial results to the UI, and require explicit confirmation before risky actions run.
 
-Instead of treating the model as a dumb text generator, NoBase uses a custom CONTROL protocol over the normal chat stream. The model is expected to emit control lines when it wants the harness to take an action:
+Instead of asking the model to return JSON in an ad hoc way, NoBase uses a custom `CONTROL` protocol embedded in the normal text stream. When the model wants the harness to act, it emits a control line:
 
-`	ext
+```text
 CONTROL {"action":"list_projects","arguments":{}}
 CONTROL {"action":"execute_project_sql","arguments":{"project":"demo","sql":"SELECT 1"}}
-`
+```
 
-If the stream contains no valid control line, the harness safely returns a fallback message instead of executing anything. That constraint keeps ungrounded chat harmless.
+If no valid control line appears, the harness returns a safe fallback message. That keeps ungrounded output from triggering actions.
 
-## What This README Covers
+## What This Document Covers
 
-- the high-level agent architecture
-- the control streaming flow
-- the tool registry and risk model
-- MCP tool bridging
-- confirmation flow
-- frontend integration contract
-- a path for incremental open-sourcing
+- architecture and responsibilities
+- control streaming protocol
+- tool registry schema
+- risk model and confirmation flow
+- MCP tool bridge design
+- frontend event contract
+- context management
+- audit and observability
+- security model
+- roadmap for incremental open-sourcing
 
 ## Architecture
 
-`	ext
+```text
 Frontend Agent Page
     |
     v
@@ -48,43 +51,70 @@ AgentLlmOrchestrationService
     |
     +-- AgentMcpToolBridge
             |
-            +-- database / auth / storage / function / cron / memory / ai / deployment tools
-`
+            +-- database / auth / storage / function / cron / memory / ai / deployment
+```
+
+### Responsibilities
+
+- **AgentChatController** handles auth, streaming response shape, and confirmation CRUD.
+- **AgentLlmOrchestrationService** runs the agent loop, manages model calls, parses the control stream, and decides when to continue, pause, or finish.
+- **AgentChatService** executes built-in platform actions.
+- **AgentMcpToolBridge** exposes external MCP tools to the harness with project context and authorization.
+- **AgentToolRegistry** declares actions, descriptions, schemas, risk levels, and confirmation requirements.
+- **AgentAuditService** records tool execution outcomes for review and replay.
+- **AgentSessionService** manages conversation history and deduplication.
+- **AgentContextAssembler** assembles, prunes, compacts, and measures the context sent to the model.
 
 ## Core Flow
 
 1. The frontend opens a streaming chat session.
-2. The backend assembles context, system prompt, memory, and project scope.
-3. The orchestration service sends the conversation to the model.
-4. While streaming, the backend looks for control lines.
-5. When a control line appears, the harness parses it, looks up the tool, checks authorization, and executes.
+2. The backend assembles system prompt, live context, memory, conversation history, and project scope.
+3. The orchestration service sends the assembled messages to the model.
+4. While streaming, the backend scans for `CONTROL` lines.
+5. When a control line appears, the harness parses it, resolves the tool, checks authorization, and executes.
 6. Tool results are injected back into the stream as structured events.
-7. If a tool is risky, a confirmation record is created and execution is paused until the user approves.
+7. If the tool is risky, a confirmation record is created and execution pauses.
 8. The session ledger records every action for audit.
 
 ## Control Protocol
 
-A control message is a single JSON object on one line prefixed with CONTROL. The harness scans streamed output and extracts it before rendering to the user.
+A control message is a single JSON object on a single line prefixed with `CONTROL`. The harness scans streamed output and extracts control lines before rendering text to the user.
 
-Example assistant output:
+### Example Model Output
 
-`	ext
-Thinking about how to show projects...
+```text
+先看一下有哪些项目...
 
 CONTROL {"action":"list_projects","arguments":{}}
 
-Here are the projects I found.
-`
+下面是结果。
+```
 
-The harness then responds with structured events such as:
+### Example Stream Events
 
-`json
+```json
 {"event":"status","text":"查询项目中..."}
-{"event":"data","tool":"list_projects","result":[{"id":"1","name":"demo"}]}
+{"event":"thinking","content":"用户想要列出项目..."}
+{"event":"tool.call","callId":"abc","name":"list_projects","title":"列出项目","riskLevel":"READ","requiresConfirm":false}
+{"event":"tool.result","callId":"abc","ok":true,"summary":"共 2 个项目","durationMs":128}
 {"event":"done"}
-`
+```
 
-This contract lets the frontend render thinking, status, tool results, and confirmation cards without inventing ad-hoc prompts.
+### Parser Behavior
+
+- Only line-start `CONTROL` tokens count.
+- The stream gate releases safe text as `delta` events.
+- If a control payload is malformed, the harness asks the user to rephrase instead of guessing.
+- Some models return long reasoning before the first visible token; the parser keeps a configurable read timeout.
+- Some gateways ignore `stream=true`; the harness can recover from a non-streaming JSON response.
+- The model may hit output length limits; the harness can continue automatically with a continuation nudge instead of failing the whole turn.
+
+### Why Not Standard Function Calling
+
+NoBase uses a custom protocol for two reasons:
+
+- the harness needs to stream visible text, thinking, status, tool results, and confirmations in one stable channel
+- the model should not hallucinate tool outputs; results are injected back into the stream by the backend
 
 ## Tool Registry
 
@@ -92,22 +122,23 @@ Tools are declared with a registry entry that includes:
 
 - action name
 - description
+- category
 - risk level
 - required role
 - argument schema
 - confirmation requirement
 - execution handler
 
-Built-in tool categories typically include:
+### Built-in Tool Categories
 
-- create_project
-- list_projects
-- xecute_project_sql
-- eset_user_password
-- schema inspection tools
-- metadata query tools
+- `create_project`
+- `list_projects`
+- `execute_project_sql`
+- `reset_user_password`
+- schema inspection
+- metadata queries
 
-MCP tool categories typically include:
+### MCP Tool Categories
 
 - database
 - auth
@@ -118,26 +149,45 @@ MCP tool categories typically include:
 - ai gateway
 - deployment
 
+### Schema Expectations
+
+A tool registry entry should be explicit enough that the frontend can render tool cards without parsing raw model text. Fields such as `title`, `summary`, `riskLevel`, and `requiresConfirm` are therefore part of the registry contract, not inferred from free-form LLM output.
+
 ## Risk Model
 
-Not every tool can run freely. The harness uses three risk levels:
+The harness uses three risk levels:
 
-- read-only operations
-- write operations
-- destructive operations
+| Risk | Meaning | Typical Behavior |
+| --- | --- | --- |
+| READ | Read-only queries | Execute without confirmation |
+| WRITE | Mutating state | Often requires confirmation |
+| DESTRUCTIVE | Data loss or irreversible change | Requires confirmation |
 
-Write and destructive operations can require an explicit confirmation flow. Confirmation state is stored outside the chat session so it survives retries and stream interruptions.
+Confirmation requirement is declared explicitly in the registry. Relying only on inferred risk is not enough because some write actions are user-initiated and safe, while some read-like queries can still be expensive or sensitive.
 
 ## MCP Tool Bridge
 
-The MCP bridge translates harness tool calls into platform service calls. It keeps a narrow public surface by exposing only authenticated metadata to the model. Service-role secrets are never sent to the model context.
+The MCP bridge converts harness tool calls into platform service calls.
 
-The bridge also normalizes errors into structured tool results so the LLM can recover instead of failing silently.
+### Design Goals
+
+- keep a narrow public surface
+- expose only authenticated metadata needed by the model
+- never send `service_role` secrets or raw admin credentials into the model context
+- normalize errors into structured tool results so the model can recover
+
+### Project Context Isolation
+
+Each tool invocation should carry project context separately from visible tool arguments. The backend resolves the project reference, validates ownership, initializes routed data access, and cleans up request-scoped state after the call.
+
+### Error Normalization
+
+Tool failures are returned as structured results with status, message, and retry hints. The harness prefers recoverable errors over silent failures.
 
 ## Confirmation Flow
 
-`	ext
-User -> risky tool
+```text
+User / model triggers risky tool
     |
     v
 Backend creates confirmation record
@@ -146,11 +196,25 @@ Backend creates confirmation record
 Frontend shows confirmation card
     |
     +-- approve -> execute and continue
-    +-- reject -> send rejection event to stream
-    +-- cancel -> end tool flow
-`
+    +-- reject  -> send rejection event to stream
+    +-- cancel  -> end tool flow
+```
 
-Confirmation records keep the original arguments, tool metadata, requester, and timestamp. This makes the agent behavior auditable and replayable.
+### Persistence and Recovery
+
+Confirmation records store:
+
+- original arguments
+- tool metadata
+- requester
+- timestamp
+- current state
+
+Because confirmation state lives outside the chat session, the flow survives retries, stream interruptions, and page refreshes. The frontend can reload pending confirmations and resume without losing context.
+
+### Atomic State Transitions
+
+Confirmation handling should use atomic state transitions. A pending confirmation should only execute if it is still pending at approval time. This prevents duplicate execution when users click multiple times or reload the page.
 
 ## Frontend Integration
 
@@ -163,18 +227,78 @@ The frontend agent page consumes streamed events and maintains local UI state fo
 - confirmation prompts
 - error fallbacks
 
-The backend should return stable event names so the frontend does not need to guess semantics from raw text.
+### Stability Contract
+
+The backend should return stable event names and stable identifiers such as `callId`. The frontend should not need to guess semantics from natural language text. Stable contracts also make it easier to add accessibility, keyboard navigation, and screen-reader support later.
+
+### Session Recovery
+
+The frontend should distinguish session expiration from other auth errors. When a session expires during a confirmation flow, the UI should preserve existing tasks and allow the user to re-authenticate and continue, rather than silently dropping the conversation.
+
+## Context Management
+
+Long agent conversations need more than a fixed message slice.
+
+The harness should:
+
+- assemble system prompt, live context, and history
+- sanitize malformed or oversized messages
+- prune oversized tool results while keeping head, tail, and a pruning marker
+- estimate token usage before sending to the model
+- compact older context when it approaches the model window
+- never drop live context such as current task, pending confirmations, and recent successful actions
+
+This keeps the model focused on the current request instead of repeating already completed work.
+
+## Audit and Observability
+
+Every meaningful tool execution should be logged with:
+
+- user and project identity
+- action and tool name
+- risk level
+- arguments, with secrets masked
+- result summary or error
+- duration
+- confirmation id when applicable
+
+Audit logging should be best-effort: failures in audit must not break the user-facing request.
+
+Observability should cover:
+
+- stream parsing failures
+- model timeout or empty outputs
+- confirmation approval or cancellation rates
+- tool execution duration
+- repeated action warnings
+
+## Security Model
+
+The harness is a privilege boundary between the model and the backend.
+
+Key rules:
+
+- never send admin or service-role secrets to the model context
+- only expose project-scoped authenticated metadata needed for tool execution
+- require confirmation for destructive or sensitive actions
+- keep confirmation state durable and tamper-evident
+- mask secrets in audit logs
+- enforce authorization before tool execution, not after
 
 ## Open Source Scope
 
-For this initial public release, the repository keeps the harness intentionally lightweight:
+This public repository shares the harness design and protocol without releasing the full internal platform implementation.
 
-- architecture and design description
-- protocol specification
-- integration guide
+Initially included:
+
+- architecture description
+- control protocol specification
+- tool registry design
+- confirmation flow design
+- frontend integration contract
 - future module roadmap
 
-Later commits can expand the public surface with:
+Future expansion may include:
 
 - standalone harness interfaces
 - example tool implementations
@@ -182,13 +306,21 @@ Later commits can expand the public surface with:
 - local MCP bridge demo
 - testing harness
 
-## Getting Help
+## Roadmap
 
-If you want to integrate the NoBase agent harness into your own platform, start with:
+- P1: audit viewer in Studio
+- P1: tool call timeout and cancellation
+- P2: parallel tool calls
+- P2: disconnect and resume support
+- P2: structured LLM summarization for context compaction
 
-1. design your control protocol contract
+## Contributing
+
+If you want to integrate or extend the NoBase agent harness, start with:
+
+1. define the control protocol contract
 2. implement a streaming controller
-3. build a tool registry with risk levels
+3. build a tool registry with explicit risk levels
 4. add a confirmation flow for risky tools
 5. expose only safe metadata to the model
 6. log every tool execution for audit
