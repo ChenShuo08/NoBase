@@ -39,13 +39,13 @@ NoBase is built to be that runtime. It is also self-hostable and designed for ma
 
 ## Quick Start
 
-### Run your own Nubase
+### Run your own NoBase
 
 ```bash
-docker run -d --name nubase \
+docker run -d --name nobase \
   -p 9999:9999 -p 5432:5432 \
-  -v nubase_data:/data \
-  <your-namespace>/nubase:latest
+  -v nobase_data:/data \
+  <your-namespace>/nobase:latest
 ```
 
 - Studio: http://localhost:9999/studio
