@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+*.md linguist-language=Markdown linguist-documentation
+*.java linguist-language=Java
+*.ts linguist-language=TypeScript
+LICENSE linguist-language=Text
